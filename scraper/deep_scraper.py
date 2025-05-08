@@ -1,4 +1,4 @@
-# backend/scraper/deep_scraper.py
+# scraper/deep_scraper.py
 """
 Deep-scan version of the IG scraper.
 

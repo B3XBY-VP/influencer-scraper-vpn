@@ -1,166 +1,71 @@
-# backend/main.py
+"""
+main.py · VPN-scraper micro-service
+───────────────────────────────────
+Exposes three protected endpoints:
+
+  POST /scrape      {handle:str}          → latest-posts scrape (DEFAULT_POST_LIMIT)
+  POST /deepScan    {handle:str}          → deep-scan scrape (DEEP_POST_LIMIT)
+  POST /rotate                              → force Surfshark IP rotation
+
+Requests must include an HTTP Bearer token that matches $SCRAPER_TOKEN.
+No Firebase / Firestore — this file is ONLY for the DigitalOcean VPN box.
+"""
 
 import os
-import json
-import requests
-import uvicorn
+from typing import Dict
 
-from fastapi import FastAPI, HTTPException, Query, Path, Body
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Depends, Body
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from firebase_admin import credentials, initialize_app, firestore
+from scraper.instagram_scraper import scrape
+from scraper.deep_scraper   import deep_scrape
+from vpn.rotate_ip          import rotate_ip
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1) Firestore initialization via JSON‐in‐env
-# ──────────────────────────────────────────────────────────────────────────────
-sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-if not sa_json:
-    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env var")
-cred = credentials.Certificate(json.loads(sa_json))
-initialize_app(cred)
-db = firestore.client()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2) Scraper-VPN service configuration
-# ──────────────────────────────────────────────────────────────────────────────
-SCRAPER_URL = os.getenv("SCRAPER_URL")
-if not SCRAPER_URL:
-    raise RuntimeError("Missing SCRAPER_URL env var")
+# ─── Auth token ──────────────────────────────────────────────────────────────
 SCRAPER_TOKEN = os.getenv("SCRAPER_TOKEN")
 if not SCRAPER_TOKEN:
-    raise RuntimeError("Missing SCRAPER_TOKEN env var")
+    raise RuntimeError("SCRAPER_TOKEN env-var must be set")
 
-from config import DEEP_SCAN_PASSWORD
+auth_scheme = HTTPBearer()
 
+def verify_token(creds: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+    if creds.credentials != SCRAPER_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ─── FastAPI app ─────────────────────────────────────────────────────────────
 app = FastAPI()
 
-# CORS (lock this down in prod!)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1) GET /api/scrape?handle=...
-# ──────────────────────────────────────────────────────────────────────────────
-@app.get("/api/scrape")
-async def api_scrape(handle: str = Query(..., description="Instagram handle")):
-    resp = requests.post(
-        f"{SCRAPER_URL}/scrape",
-        json={"handle": handle},
-        headers={"Authorization": f"Bearer {SCRAPER_TOKEN}"}
-    )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    data = resp.json()
-    db.collection("creators").document(handle).set(
-        {**data, "handle": handle, "lastChecked": firestore.SERVER_TIMESTAMP},
-        merge=True,
-    )
-    return data
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2) GET /api/deepScan?handle=...&pw=...
-# ──────────────────────────────────────────────────────────────────────────────
-@app.get("/api/deepScan")
-async def api_deep_scan(
-    handle: str = Query(..., description="Instagram handle"),
-    pw: str = Query(None, description="Deep-scan password"),
-):
-    if pw != DEEP_SCAN_PASSWORD:
-        raise HTTPException(status_code=403, detail="Invalid deep-scan password")
-    resp = requests.post(
-        f"{SCRAPER_URL}/deepScan",
-        json={"handle": handle},
-        headers={"Authorization": f"Bearer {SCRAPER_TOKEN}"}
-    )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    data = resp.json()
-    db.collection("creators").document(handle).set(
-        {**data, "handle": handle, "lastChecked": firestore.SERVER_TIMESTAMP},
-        merge=True,
-    )
-    return data
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 3) POST /api/recheck/{id}
-# ──────────────────────────────────────────────────────────────────────────────
-@app.post("/api/recheck/{id}")
-async def api_recheck(id: str = Path(..., description="Creator document ID")):
-    doc = db.collection("creators").document(id).get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="Creator not found")
-    handle = doc.to_dict().get("handle")
-    resp = requests.post(
-        f"{SCRAPER_URL}/scrape",
-        json={"handle": handle},
-        headers={"Authorization": f"Bearer {SCRAPER_TOKEN}"}
-    )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    data = resp.json()
-    db.collection("creators").document(id).update(
-        {**data, "lastChecked": firestore.SERVER_TIMESTAMP}
-    )
+@app.get("/health")
+def health():
     return {"status": "ok"}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4) POST /api/deepScan/{id}
-# ──────────────────────────────────────────────────────────────────────────────
-@app.post("/api/deepScan/{id}")
-async def api_deep_recheck(id: str = Path(..., description="Creator document ID")):
-    doc = db.collection("creators").document(id).get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="Creator not found")
-    handle = doc.to_dict().get("handle")
-    resp = requests.post(
-        f"{SCRAPER_URL}/deepScan",
-        json={"handle": handle},
-        headers={"Authorization": f"Bearer {SCRAPER_TOKEN}"}
-    )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    data = resp.json()
-    db.collection("creators").document(id).update(
-        {**data, "lastChecked": firestore.SERVER_TIMESTAMP}
-    )
-    return {"status": "ok"}
+@app.post("/scrape", dependencies=[Depends(verify_token)])
+async def api_scrape(body: Dict = Body(...)):
+    handle = body.get("handle")
+    if not handle:
+        raise HTTPException(status_code=422, detail="handle required")
+    return await scrape(handle)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5–7) Burner account endpoints (unchanged)
-# ──────────────────────────────────────────────────────────────────────────────
-from bot.burner_login import login_and_store, refresh_session
+@app.post("/deepScan", dependencies=[Depends(verify_token)])
+async def api_deep_scan(body: Dict = Body(...)):
+    handle = body.get("handle")
+    if not handle:
+        raise HTTPException(status_code=422, detail="handle required")
+    return await deep_scrape(handle)
 
-@app.get("/api/burners")
-async def list_burners():
-    docs = db.collection("burners").stream()
-    return [{"id": d.id, **d.to_dict()} for d in docs]
+@app.post("/rotate", dependencies=[Depends(verify_token)])
+def api_rotate():
+    return {"ip": rotate_ip()}
 
-@app.post("/api/burners")
-async def add_burner(body: dict = Body(...)):
-    username = body.get("username")
-    password = body.get("password")
-    if not username or not password:
-        raise HTTPException(status_code=400, detail="Both username and password are required")
-    doc_ref = db.collection("burners").document()
-    doc_ref.set({"username": username, "password": password, "status": "pending"})
-    asyncio.create_task(login_and_store(doc_ref.id, username, password))
-    return {"id": doc_ref.id}
-
-@app.post("/api/burners/{id}/refresh")
-async def refresh_burner(id: str = Path(..., description="Burner document ID")):
-    doc = db.collection("burners").document(id).get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="Burner not found")
-    data = doc.to_dict()
-    session = refresh_session(id, data["username"], data["password"])
-    return {"session": session}
-
+# ─── Local run (`python main.py`) ─────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+    )
+
 
 
 

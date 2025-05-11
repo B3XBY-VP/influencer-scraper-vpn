@@ -1,56 +1,61 @@
-# backend/Dockerfile (Fly.io public API)
+# ──────────────────────────────────────────────────────────────────────────────
+# influencer-scraper-vpn · Dockerfile
+# Builds a container that runs:  ➜ Playwright + Python 3.11  ➜ Surfshark OpenVPN
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ---------- Build stage ----------
+##############################
+# 1.  BUILD STAGE (Playwright)
+##############################
 FROM python:3.11-slim AS builder
-WORKDIR /build
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+WORKDIR /build
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      curl gnupg ca-certificates \
-      ffmpeg libnss3 libatk-bridge2.0-0 libgtk-3-0 \
-      libdrm2 libgbm1 libasound2 libxdamage1 libxrandr2 fonts-liberation \
- && rm -rf /var/lib/apt/lists/*
+# OS packages required by Playwright’s browsers
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl gnupg ca-certificates \
+        ffmpeg libnss3 libatk-bridge2.0-0 libgtk-3-0 \
+        libdrm2 libgbm1 libasound2 libxdamage1 libxrandr2 fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt . 
-RUN python3 -m pip install --upgrade pip \
- && python3 -m pip install --no-cache-dir -r requirements.txt \
- && python3 -m playwright install --with-deps
+COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    playwright install --with-deps
 
-# ───────────────────────────────────────────────────────────────
-# Runtime image
-# ───────────────────────────────────────────────────────────────
+##############################
+# 2.  RUNTIME STAGE
+##############################
 FROM python:3.11-slim
-LABEL org.opencontainers.image.source="https://github.com/<your-org>/influencer-tracking"
-
 ENV PYTHONUNBUFFERED=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    PYTHONPATH=/app
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# 1) Copy in all Python + Playwright bits
+# ── Runtime deps: bash + OpenVPN + dumb-init ──────────────────────────────────
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        openvpn iproute2 procps libcap2-bin \
+        dumb-init ca-certificates bash && \
+    setcap cap_net_admin,cap_net_raw+ep "$(which openvpn)" && \
+    mkdir -p /dev/net && mknod /dev/net/tun c 10 200 && chmod 600 /dev/net/tun && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Copy Python site-packages & Playwright browsers from builder ──────────────
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /ms-playwright /ms-playwright
 
-# 2) Install runtime deps
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      dumb-init ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-
-# 3) Copy your code & entrypoint
+# ── Copy application code ─────────────────────────────────────────────────────
 WORKDIR /app
 COPY . .
 
-# 4) Create unprivileged user & fix perms
-RUN chmod +x docker-entrypoint.sh \
- && useradd -m appuser \
- && chown -R appuser:appuser /app
-
+# ── Entrypoint permissions & unprivileged user ────────────────────────────────
+RUN chmod +x docker-entrypoint.sh && \
+    useradd -m appuser && \
+    chown -R appuser:appuser /app
 USER appuser
-EXPOSE 8000
 
-# 5) Launch
+EXPOSE 8000
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/app/docker-entrypoint.sh"]
+
 
 
 
